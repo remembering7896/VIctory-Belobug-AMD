@@ -1383,31 +1383,67 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// submitting thread inside a submission, and the title's page-mapping copies
 /// are the one thing there that costs a kernel call a page: with this line
 /// they can be told from our own work instead of guessed at.
-struct Slow(Option<(&'static str, usize, u64, std::time::Instant)>);
+struct Slow {
+    what: &'static str,
+    ranges: usize,
+    pages: u64,
+    began: std::time::Instant,
+    show: u64,
+    note: u64,
+    mapped: u64,
+}
 
 impl Slow {
     fn begin(what: &'static str, pages: u64) -> Self {
-        Self(Some((what, 0, pages, std::time::Instant::now())))
+        Self::new(what, 0, pages)
     }
 
     fn ranges(ranges: &[(u64, u64, u64)]) -> Self {
         let pages = ranges.iter().map(|r| r.2).sum::<u64>() / PAGE as u64;
-        Self(Some(("map_aliases", ranges.len(), pages, std::time::Instant::now())))
+        Self::new("map_aliases", ranges.len(), pages)
+    }
+
+    fn new(what: &'static str, ranges: usize, pages: u64) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        Self {
+            what,
+            ranges,
+            pages,
+            began: std::time::Instant::now(),
+            show: SHOW_NS.load(Relaxed),
+            note: NOTE_NS.load(Relaxed),
+            mapped: MAPPED_PAGES.load(Relaxed),
+        }
     }
 }
 
 impl Drop for Slow {
     fn drop(&mut self) {
-        let Some((what, ranges, pages, began)) = self.0.take() else {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ms = self.began.elapsed().as_millis();
+        if ms < 50 {
             return;
-        };
-        let ms = began.elapsed().as_millis();
-        if ms >= 50 {
-            tracing::warn!(ms, what, ranges, pages, "slow page mapping call");
         }
+        let (show, note, mapped) = (
+            SHOW_NS.load(Relaxed) - self.show,
+            NOTE_NS.load(Relaxed) - self.note,
+            MAPPED_PAGES.load(Relaxed) - self.mapped,
+        );
+        let page = mapped.max(1) as u64;
+        tracing::warn!(
+            ms,
+            what = self.what,
+            ranges = self.ranges,
+            pages = self.pages,
+            mapped,
+            kernel_ns = show,
+            ours_ns = note,
+            kernel_us_a_page = show / page / 1000,
+            ours_us_a_page = note / page / 1000,
+            "slow page mapping call"
+        );
     }
 }
-
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _slow = Slow::ranges(ranges);
@@ -1806,10 +1842,12 @@ mod pool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    let began = std::time::Instant::now();
     let own = physical.holes.remove(&base) == Some(len) && lean();
     if !show(base, len, &slice, own) {
         return false;
     }
+    let mapped = began.elapsed().as_nanos() as u64;
     // Noted before the GPU side is told: bytes DirectStorage put in earlier,
     // without notice at these addresses ([`pages_written`]), are there by
     // the time the copies of them go.
@@ -1819,8 +1857,21 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     physical.views.insert(base, (len, slice));
+    // Where the time went: the kernel's mapping, and everything after it
+    // (the notes, the guards, the GPU side's census). A page that costs
+    // 58 us is not necessarily the kernel's.
+    let all = began.elapsed().as_nanos() as u64;
+    SHOW_NS.fetch_add(mapped, std::sync::atomic::Ordering::Relaxed);
+    NOTE_NS.fetch_add(all.saturating_sub(mapped), std::sync::atomic::Ordering::Relaxed);
+    MAPPED_PAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
 }
+
+/// Time the kernel took mapping pages, the time the rest took, and how many
+/// pages: what a slow `map_aliases` spends its milliseconds on.
+static SHOW_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NOTE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MAPPED_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cuts `[base, base + len)` out of the placeholder it is in (which fails
 /// harmlessly when the range is the whole placeholder).
