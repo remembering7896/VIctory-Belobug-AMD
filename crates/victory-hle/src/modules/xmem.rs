@@ -1358,7 +1358,6 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
-    victory_gpu::soft::use_books(&SOFT_BOOKS);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
@@ -1382,11 +1381,11 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
-/// Notes `[to, to + len)` as a soft view of the pages at `from`, and tells the
+/// Notes `[to, to + len)` as soft views of the pages at `from`, and tells the
 /// GPU side what the range shows as [`map`] would: only the kernel mapping is
-/// left for the moment a page is touched (`victory_gpu::soft`). The view is
-/// not put in `Physical::views`: nothing is mapped at `to` yet, and what is
-/// mapped there must stay what `slice_at` answers.
+/// left, for the moment a page is touched (`victory_gpu::soft`). The views are
+/// not put in `Physical::views`: nothing is mapped at `to`, and what is mapped
+/// there must stay what `slice_at` answers.
 fn note_soft(physical: &mut Physical, to: usize, from: usize, len: usize) {
     let mut shown = shown_mut();
     for k in (0..len).step_by(PAGE) {
@@ -1395,45 +1394,67 @@ fn note_soft(physical: &mut Physical, to: usize, from: usize, len: usize) {
         shown.note(to + k, PAGE, &slice);
         victory_gpu::title_memory_remapped(to + k, PAGE);
         victory_gpu::title_memory_view(to + k, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
-        victory_gpu::soft::noted(to + k, at, PAGE);
+        let pin = PagePin {
+            section: slice.section.clone(),
+            index: slice.index,
+        };
+        victory_gpu::soft::noted(to + k, Arc::new(pin));
     }
 }
 
-/// The books a soft view reads from and is mapped by: the title's own pages,
-/// read through the section's kept view, so a page need not be mapped at `at`
-/// to be read.
-struct SoftBooks;
+/// A noted page: the title's section page, kept alive here, and its place in
+/// the section. Enough to read it through the section's kept view, or to map
+/// it at any address, without the title's view table: that is the whole point,
+/// since the title reads its memory while holding that table.
+struct PagePin {
+    section: Arc<Section>,
+    index: usize,
+}
 
-static SOFT_BOOKS: SoftBooks = SoftBooks;
-
-impl victory_gpu::soft::Books for SoftBooks {
-    fn read(&self, from: usize, _at: usize, to: &mut [u8]) -> bool {
-        let physical = physical();
-        let Some(slice) = physical.slice_at(from) else {
-            return false;
-        };
-        let Some(window) = slice.section.window(slice.index, 1) else {
+impl victory_gpu::soft::Pin for PagePin {
+    fn read(&self, to: &mut [u8]) -> bool {
+        let Some(window) = self.section.window(self.index, 1) else {
             return false;
         };
         let n = to.len().min(PAGE);
-        // SAFETY: the section's own view, kept by the section, of the page at
-        // `slice.index`: `window` commits the pages it returns.
+        // SAFETY: the section's own kept view, which `window` commits the
+        // pages it returns into.
         unsafe { std::ptr::copy_nonoverlapping(window as *const u8, to.as_mut_ptr(), n) };
         n == to.len()
     }
 
-    fn map(&self, at: usize, from: usize, len: usize) -> bool {
-        let mut physical = physical();
-        let mut k = 0;
-        while k < len {
-            let Some(slice) = physical.slice_at(from + k) else {
-                return false;
+    fn map(&self, at: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, MapViewOfFile3,
+        };
+        // SAFETY: replaces the placeholder at `at` with the section's page,
+        // holding only the section, which this pin keeps alive.
+        let view = unsafe {
+            MapViewOfFile3(
+                self.section.handle,
+                GetCurrentProcess(),
+                at as *const c_void,
+                (self.index * PAGE) as u64,
+                PAGE,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if view.Value as usize != at {
+            return false;
+        }
+        // What the range shows now, for the GPU side's census, as `map` says
+        // it. The view table learns of it only if it is free at this moment:
+        // the bytes are there either way, and a fault must not wait on it.
+        victory_gpu::title_memory_view(at, PAGE, self.section.handle as usize, (self.index * PAGE) as u64);
+        if let Ok(mut physical) = PHYSICAL.try_lock() {
+            let slice = Slice {
+                section: self.section.clone(),
+                index: self.index,
             };
-            let n = PAGE.min(len - k);
-            if !map(&mut physical, at + k, n, slice) {
-                return false;
-            }
-            k += n;
+            physical.views.insert(at, (PAGE, slice));
         }
         true
     }
@@ -1473,7 +1494,6 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _slow = Slow::ranges(ranges);
     let _costed = Costed::begin(None);
     lift_thread();
-    victory_gpu::soft::use_books(&SOFT_BOOKS);
     if victory_gpu::soft::on() {
         let mut physical = physical();
         for &(to, from, len) in ranges {
