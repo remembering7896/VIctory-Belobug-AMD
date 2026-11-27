@@ -1380,6 +1380,21 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// Whether something is committed (mapped) at `at`.
+fn mapped(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQueryEx};
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a query of our own address space into a struct we own.
+    let got = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            at as *const c_void,
+            &raw mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    got != 0 && info.State & MEM_COMMIT != 0
+}
 /// What `at` is now, in the kernel's words: state, type, protection, the
 /// allocation it belongs to, and that allocation's size.
 fn describe(at: usize) -> String {
@@ -1435,6 +1450,11 @@ fn note_soft(physical: &mut Physical, to: usize, from: usize, len: usize) -> boo
             section: slice.section.clone(),
             index: slice.index,
         };
+        // The page is cut out of whatever placeholder holds it now, while
+        // this thread holds the table and nothing else is mapping there: on
+        // the fault it would be too late, an unmap in between can take the
+        // placeholder away (that was the last three 487s).
+        split(to + k, PAGE);
         victory_gpu::soft::noted(to + k, Arc::new(pin));
     }
     true
@@ -1498,10 +1518,7 @@ impl victory_gpu::soft::Pin for PagePin {
         use windows_sys::Win32::System::Memory::{
             MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, MapViewOfFile3,
         };
-        // The placeholder there may be longer than a page: cut this page out
-        // of it first, as `show` does for a range it does not own. Without
-        // this the mapping is refused with 487.
-        split(at, PAGE);
+
         // SAFETY: replaces the placeholder at `at` with the section's page,
         // holding only the section, which this pin keeps alive.
         let view = unsafe {
@@ -1518,6 +1535,13 @@ impl victory_gpu::soft::Pin for PagePin {
             )
         };
         if view.Value as usize != at {
+            // Refused. If something is mapped there already, the page is
+            // there: the title (or another of its views of the same page)
+            // mapped it between the note and this touch, and putting a second
+            // view of the same page over it changes nothing.
+            if mapped(at) {
+                return true;
+            }
             return false;
         }
         // What the range shows now, for the GPU side's census, as `map` says
