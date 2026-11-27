@@ -1354,6 +1354,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    let _slow = Slow::begin("map_alias", len / PAGE as u64);
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
@@ -1376,8 +1377,39 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// A page-mapping call that took long: logged on the way out, early returns
+/// included. The 4.5 s stall of one run (before the device went) was the
+/// submitting thread inside a submission, and the title's page-mapping copies
+/// are the one thing there that costs a kernel call a page: with this line
+/// they can be told from our own work instead of guessed at.
+struct Slow(Option<(&'static str, usize, u64, std::time::Instant)>);
+
+impl Slow {
+    fn begin(what: &'static str, pages: u64) -> Self {
+        Self(Some((what, 0, pages, std::time::Instant::now())))
+    }
+
+    fn ranges(ranges: &[(u64, u64, u64)]) -> Self {
+        let pages = ranges.iter().map(|r| r.2).sum::<u64>() / PAGE as u64;
+        Self(Some(("map_aliases", ranges.len(), pages, std::time::Instant::now())))
+    }
+}
+
+impl Drop for Slow {
+    fn drop(&mut self) {
+        let Some((what, ranges, pages, began)) = self.0.take() else {
+            return;
+        };
+        let ms = began.elapsed().as_millis();
+        if ms >= 50 {
+            tracing::warn!(ms, what, ranges, pages, "slow page mapping call");
+        }
+    }
+}
+
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
+    let _slow = Slow::ranges(ranges);
     let _costed = Costed::begin(None);
     lift_thread();
     if side_by_side() <= 1 {
