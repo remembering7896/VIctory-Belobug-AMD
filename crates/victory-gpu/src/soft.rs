@@ -94,7 +94,22 @@ pub fn noted(at: usize, pin: Arc<dyn Pin>) {
     let base = at - at % PAGE;
     pins().get_or_insert_with(Default::default).insert(base, pin);
     SOFT.set(block(base));
-    NOTED.fetch_add(1, Ordering::Relaxed);
+    let noted = NOTED.fetch_add(1, Ordering::Relaxed) + 1;
+    // A line every 512 pages: whether a soft view is worth having is the
+    // ratio of pages made real to pages noted, and nothing else.
+    if noted % 512 == 0 {
+        let (noted, made, gone, read, failed) = counters();
+        let still = noted.saturating_sub(made + gone);
+        tracing::info!(
+            noted,
+            made_real = made,
+            let_go = gone,
+            still_soft = still,
+            read_mb = read / (1 << 20),
+            failed,
+            "soft views"
+        );
+    }
 }
 
 /// Lets the noted pages of `[at, at + len)` go: the title unmapped them.
