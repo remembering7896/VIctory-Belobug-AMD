@@ -5158,9 +5158,10 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not).
+/// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=1`: it is; off by default: in the world it cost 1.6 ms a frame more than the read lock it saves, two alternating 25 s runs, 50.8 against 49.2).
 fn quick_find() -> bool {
-    crate::toggled!("VICTORY_QUICK_FIND")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUICK_FIND").is_some_and(|v| v == "1"))
 }
 
 fn found_at(address: u64, len: u64) -> usize {
