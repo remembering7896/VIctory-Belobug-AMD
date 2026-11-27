@@ -135,10 +135,10 @@ inside the victory process, there is no separate game process.
   [#545](https://github.com/Belobug/VIctory-Belobug-AMD/issues/545), reproduced
   on RDNA3 and RDNA4. `VICTORY_LATE_WAIT=0` removes it and takes the frame from
   45.7 to 113.9 ms. [PR #636](https://github.com/Belobug/VIctory-Belobug-AMD/pull/636)
-  makes a slot flip only at a moment with nothing in the air; it is built into a
-  separate tree here (`D:\victory-belobug\VIctory-636`, `run-636.bat`) to be
-  judged on the picture, because one measured block (43.0 and 53.2 ms, the
-  second a stall) says nothing.
+  makes a slot flip only at a moment with nothing in the air; it was merged
+  into a separate build, measured (43.0 and 53.2 ms, the second a stall) and
+  played, and it did not earn its place: the build, the branch and the tree it
+  lived in are gone. Nothing here carries it.
 - **`WC_NO_BACK`'s own census** (13 minutes, 0 reads of a title page): about 20%
   of the ranges cannot be guarded, a write followed by a read inside the same
   second is not seen, and one tester in five saw a shirt turn dark grey once.
