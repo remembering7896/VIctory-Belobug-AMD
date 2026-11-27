@@ -1362,8 +1362,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
-    if victory_gpu::soft::on() && from != 0 {
-        note_soft(&mut physical, to, from, len);
+    if victory_gpu::soft::on() && from != 0 && note_soft(&mut physical, to, from, len) {
         return true;
     }
     for k in (0..len).step_by(PAGE) {
@@ -1381,12 +1380,50 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// What `at` is now, in the kernel's words: state, type, protection, the
+/// allocation it belongs to, and that allocation's size.
+fn describe(at: usize) -> String {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQueryEx};
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a query of our own address space into a struct we own.
+    let got = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            at as *const c_void,
+            &raw mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if got == 0 {
+        return format!("query failed: {}", std::io::Error::last_os_error());
+    }
+    format!(
+        "state={:#x} type={:#x} protect={:#x} alloc={:#x} region={:#x}",
+        info.State, info.Type, info.Protect, info.AllocationBase as usize, info.RegionSize
+    )
+}
 /// Notes `[to, to + len)` as soft views of the pages at `from`, and tells the
 /// GPU side what the range shows as [`map`] would: only the kernel mapping is
 /// left, for the moment a page is touched (`victory_gpu::soft`). The views are
 /// not put in `Physical::views`: nothing is mapped at `to`, and what is mapped
 /// there must stay what `slice_at` answers.
-fn note_soft(physical: &mut Physical, to: usize, from: usize, len: usize) {
+fn note_soft(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
+
+    // What the range is right now, for the log: a soft view can only be made
+    // where a mapping can be put back, and three tries in a row guessed wrong
+    // about that.
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+            tracing::info!(
+                to = format_args!("{to:#x}"),
+                len,
+                region = %describe(to),
+                "a soft view is noted here"
+            );
+        }
+    }
     let mut shown = shown_mut();
     for k in (0..len).step_by(PAGE) {
         let at = from + k;
@@ -1400,6 +1437,40 @@ fn note_soft(physical: &mut Physical, to: usize, from: usize, len: usize) {
         };
         victory_gpu::soft::noted(to + k, Arc::new(pin));
     }
+    true
+}
+
+/// Makes `[base, base + len)` a placeholder of ours. The query at note time
+/// said what is there: `state=0x2000 type=0x20000` -- a plain reservation of
+/// the title's, 7 GB of them, not a placeholder, which is why mapping into it
+/// was 487. A reservation cannot become a mapped view, but a placeholder can
+/// be put in its place: release the slice, reserve it as one.
+fn placeholder(base: usize, len: usize) -> bool {
+    // SAFETY: releases a slice of a reservation; nothing is mapped there.
+    counted(Call::Unmap, || unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE) });
+    // SAFETY: reserves the same range as a placeholder, which a view can
+    // replace page by page later.
+    let at = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            base as *const c_void,
+            len,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if at as usize == base {
+        return true;
+    }
+    tracing::warn!(
+        at = format_args!("{base:#x}"),
+        len,
+        error = %std::io::Error::last_os_error(),
+        "no placeholder for a soft view"
+    );
+    false
 }
 
 /// A noted page: the title's section page, kept alive here, and its place in
@@ -1427,6 +1498,10 @@ impl victory_gpu::soft::Pin for PagePin {
         use windows_sys::Win32::System::Memory::{
             MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, MapViewOfFile3,
         };
+        // The placeholder there may be longer than a page: cut this page out
+        // of it first, as `show` does for a range it does not own. Without
+        // this the mapping is refused with 487.
+        split(at, PAGE);
         // SAFETY: replaces the placeholder at `at` with the section's page,
         // holding only the section, which this pin keeps alive.
         let view = unsafe {
