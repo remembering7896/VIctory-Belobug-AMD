@@ -82,7 +82,6 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;
-pub mod soft;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]

@@ -1362,9 +1362,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
-    if victory_gpu::soft::on() && from != 0 && note_soft(&mut physical, to, from, len) {
-        return true;
-    }
+
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -1380,188 +1378,6 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
-/// Whether something is committed (mapped) at `at`.
-fn mapped(at: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQueryEx};
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a query of our own address space into a struct we own.
-    let got = unsafe {
-        VirtualQueryEx(
-            GetCurrentProcess(),
-            at as *const c_void,
-            &raw mut info,
-            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-        )
-    };
-    got != 0 && info.State & MEM_COMMIT != 0
-}
-/// What `at` is now, in the kernel's words: state, type, protection, the
-/// allocation it belongs to, and that allocation's size.
-fn describe(at: usize) -> String {
-    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQueryEx};
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a query of our own address space into a struct we own.
-    let got = unsafe {
-        VirtualQueryEx(
-            GetCurrentProcess(),
-            at as *const c_void,
-            &raw mut info,
-            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-        )
-    };
-    if got == 0 {
-        return format!("query failed: {}", std::io::Error::last_os_error());
-    }
-    format!(
-        "state={:#x} type={:#x} protect={:#x} alloc={:#x} region={:#x}",
-        info.State, info.Type, info.Protect, info.AllocationBase as usize, info.RegionSize
-    )
-}
-/// Notes `[to, to + len)` as soft views of the pages at `from`, and tells the
-/// GPU side what the range shows as [`map`] would: only the kernel mapping is
-/// left, for the moment a page is touched (`victory_gpu::soft`). The views are
-/// not put in `Physical::views`: nothing is mapped at `to`, and what is mapped
-/// there must stay what `slice_at` answers.
-fn note_soft(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
-
-    // What the range is right now, for the log: a soft view can only be made
-    // where a mapping can be put back, and three tries in a row guessed wrong
-    // about that.
-    {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEEN: AtomicU64 = AtomicU64::new(0);
-        if SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
-            tracing::info!(
-                to = format_args!("{to:#x}"),
-                len,
-                region = %describe(to),
-                "a soft view is noted here"
-            );
-        }
-    }
-    let mut shown = shown_mut();
-    for k in (0..len).step_by(PAGE) {
-        let at = from + k;
-        let Some(slice) = physical.slice_at(at) else { break };
-        shown.note(to + k, PAGE, &slice);
-        victory_gpu::title_memory_remapped(to + k, PAGE);
-        victory_gpu::title_memory_view(to + k, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
-        let pin = PagePin {
-            section: slice.section.clone(),
-            index: slice.index,
-        };
-        // The page is cut out of whatever placeholder holds it now, while
-        // this thread holds the table and nothing else is mapping there: on
-        // the fault it would be too late, an unmap in between can take the
-        // placeholder away (that was the last three 487s).
-        split(to + k, PAGE);
-        victory_gpu::soft::noted(to + k, Arc::new(pin));
-    }
-    true
-}
-
-/// Makes `[base, base + len)` a placeholder of ours. The query at note time
-/// said what is there: `state=0x2000 type=0x20000` -- a plain reservation of
-/// the title's, 7 GB of them, not a placeholder, which is why mapping into it
-/// was 487. A reservation cannot become a mapped view, but a placeholder can
-/// be put in its place: release the slice, reserve it as one.
-fn placeholder(base: usize, len: usize) -> bool {
-    // SAFETY: releases a slice of a reservation; nothing is mapped there.
-    counted(Call::Unmap, || unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE) });
-    // SAFETY: reserves the same range as a placeholder, which a view can
-    // replace page by page later.
-    let at = unsafe {
-        VirtualAlloc2(
-            GetCurrentProcess(),
-            base as *const c_void,
-            len,
-            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-            PAGE_NOACCESS,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if at as usize == base {
-        return true;
-    }
-    tracing::warn!(
-        at = format_args!("{base:#x}"),
-        len,
-        error = %std::io::Error::last_os_error(),
-        "no placeholder for a soft view"
-    );
-    false
-}
-
-/// A noted page: the title's section page, kept alive here, and its place in
-/// the section. Enough to read it through the section's kept view, or to map
-/// it at any address, without the title's view table: that is the whole point,
-/// since the title reads its memory while holding that table.
-struct PagePin {
-    section: Arc<Section>,
-    index: usize,
-}
-
-impl victory_gpu::soft::Pin for PagePin {
-    fn read(&self, to: &mut [u8]) -> bool {
-        let Some(window) = self.section.window(self.index, 1) else {
-            return false;
-        };
-        let n = to.len().min(PAGE);
-        // SAFETY: the section's own kept view, which `window` commits the
-        // pages it returns into.
-        unsafe { std::ptr::copy_nonoverlapping(window as *const u8, to.as_mut_ptr(), n) };
-        n == to.len()
-    }
-
-    fn map(self: Arc<Self>, at: usize) -> bool {
-        use windows_sys::Win32::System::Memory::{
-            MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, MapViewOfFile3,
-        };
-
-        // SAFETY: replaces the placeholder at `at` with the section's page,
-        // holding only the section, which this pin keeps alive.
-        let view = unsafe {
-            MapViewOfFile3(
-                self.section.handle,
-                GetCurrentProcess(),
-                at as *const c_void,
-                (self.index * PAGE) as u64,
-                PAGE,
-                MEM_REPLACE_PLACEHOLDER,
-                PAGE_READWRITE,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if view.Value as usize != at {
-            // Refused. If something is mapped there already, the page is
-            // there: the title (or another of its views of the same page)
-            // mapped it between the note and this touch, and putting a second
-            // view of the same page over it changes nothing.
-            if mapped(at) {
-                return true;
-            }
-            return false;
-        }
-        // What the range shows now, for the GPU side's census, as `map` says
-        // it. The view table learns of it only if it is free at this moment:
-        // the bytes are there either way, and a fault must not wait on it.
-        victory_gpu::title_memory_view(at, PAGE, self.section.handle as usize, (self.index * PAGE) as u64);
-        if let Ok(mut physical) = PHYSICAL.try_lock() {
-            let slice = Slice {
-                section: self.section.clone(),
-                index: self.index,
-            };
-            physical.views.insert(at, (PAGE, slice));
-        }
-        // Recorded where an unmap will look even when the table above was
-        // busy: a mapped page's placeholder must be kept when it goes, or no
-        // pin can map that address again.
-        victory_gpu::soft::made(at, self);
-        true
-    }
-}
 /// A page-mapping call that took long: logged on the way out, early returns
 /// included. The 4.5 s stall of one run (before the device went) was the
 /// submitting thread inside a submission, and the title's page-mapping copies
@@ -1597,17 +1413,6 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _slow = Slow::ranges(ranges);
     let _costed = Costed::begin(None);
     lift_thread();
-    if victory_gpu::soft::on() {
-        let mut physical = physical();
-        for &(to, from, len) in ranges {
-            let (to, from, len) = (to as usize, from as usize, len as usize);
-            unmap(&mut physical, to, len);
-            if from != 0 {
-                note_soft(&mut physical, to, from, len);
-            }
-        }
-        return true;
-    }
     if side_by_side() <= 1 {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
@@ -2134,7 +1939,7 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
-    victory_gpu::soft::gone(base, len);
+
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
@@ -2142,26 +1947,6 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         return;
     }
     let end = base + len;
-    // Pages a pin mapped: the title's table may not know them (soft::made).
-    // They are views like any other and keep their placeholders when they go.
-    for at in victory_gpu::soft::taken(base, len) {
-        // SAFETY: a view a pin mapped there; it becomes a placeholder again.
-        let gone = counted(Call::Unmap, || unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        });
-        if gone != 0 {
-            victory_gpu::title_memory_unmapping(at, PAGE);
-            physical.holes.insert(at, PAGE);
-        }
-    }
-    // Views do not overlap: the one holding `base`, then those starting
-    // inside (the GPU's page mappings make one view per page).
     let first = physical
         .views
         .range(..=base)

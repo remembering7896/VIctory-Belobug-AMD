@@ -3779,25 +3779,6 @@ pub(crate) fn install() {
             unsafe { (*context).Rip = exit as u64 };
             EXCEPTION_CONTINUE_EXECUTION
         };
-        // A view the layer noted and never mapped: the page is mapped on the
-        // maker thread (never on this one, which may hold the title's view
-        // table), and the instruction is run again.
-        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS && r.NumberParameters >= 2 {
-            let at = r.ExceptionInformation[1];
-            if crate::soft::any(at) {
-                if !crate::soft::real(at, PAGE) {
-                    tracing::error!(
-                        at = format_args!("{at:#x}"),
-                        "a soft page could not be made real: the fault goes on to the crash reporter"
-                    );
-                    return EXCEPTION_CONTINUE_SEARCH;
-                }
-                return match ours {
-                    Some(exit) => fail(exit),
-                    None => EXCEPTION_CONTINUE_EXECUTION,
-                };
-            }
-        }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
