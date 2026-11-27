@@ -1,58 +1,58 @@
 # VIctory on an RX 7900 XTX
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
+A fork of [VIctory](https://github.com/Marvisak/VIctory): a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
-
-## The goal
-
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
-
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+This fork works on AMD RDNA3 (RX 7900 XTX) and keeps its numbers on one PC, so
+that a change is judged against the same machine and the same scene.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-26)
-
-The measurements below come from one Windows 11 PC with an Intel i9-12900K,
-64 GB of system RAM and a Radeon RX 7900 XTX (24 GB of dedicated video memory).
-Ray tracing was off for these runs.
+## The PC these numbers come from
 
 | | |
 |---|---|
-| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
-| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
-| Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
-| Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 30 GB of private memory, 10.5 GB of VRAM: **64 GB of RAM recommended** for now |
+| CPU | Ryzen 7 9800X3D |
+| Memory | 32 GB |
+| GPU | Radeon RX 7900 XTX, 24 GB |
+| OS | Windows 11 x64 |
+| Title build | 1.0.2.1, Series X profile, ray tracing off, 3840x2160 output |
 
-It started at 280 ms a frame in the same scenes three days earlier. What sets
-the frame now is the one thread that submits the title's work to the card
-(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
+## Where it stands (2026-11-28)
 
-### Reports from other GPUs
+Heavy frames in the open world, Series X profile, the tuned launcher
+(`run-tuned.bat`), the title's own upscaler:
 
-| GPU and build | What the contributor observed |
+| | |
 |---|---|
-| Radeon RX 9060 XT (16 GB), `cd8dfc0` with local changes | In the same Series X interior at 1080p, the game averaged 19.8 fps with ray tracing off and 15.6 fps with it on. Indirect lighting showed white patches and dark smears. [Run settings and results](https://github.com/Belobug/VIctory-Belobug-AMD/issues/313) |
-| GeForce RTX 3090 (24 GB), `a-publier@cd8dfc0` | The prison rendered. Two warm Series S runs averaged 545 and 532 ms per frame. The contributor reported 10.0 and 10.2 GB of VRAM in those runs. [Run settings and results](https://github.com/Belobug/VIctory-Belobug-AMD/issues/333) |
-| Intel Arc B580 (12 GB), revision unreported | Startup and initial menu navigation worked. Further menu interaction slowed to about 0.7 fps before D3D12 device removal. [Crash report](https://github.com/Belobug/VIctory-Belobug-AMD/issues/98) |
+| Frame | **43-49 ms** (about 21-23 fps), 5,900-7,000 draws a frame |
+| Light scenes | 33-35 ms, against the title's own 30 fps limit |
+| Preparing, submitting thread | 25.0 ms, of it copies 7.3 ms / 33 MB and texture refreshes 0.9 ms |
+| Copying back | **1.3 ms / 1.3 MB** |
+| The card | 5.5 ms |
+| The title's own work | about 17 ms, not covered by any meter of ours |
 
-The 10.5 GB of VRAM in the RX 7900 XTX table is the usage reported for that run.
-Memory use and frame time depend on the scene and settings. The [ray-tracing notes](docs/fork-ray-tracing.md)
-describe which lighting paths run and the remaining rendering issues.
+That last line is the one to know: a 1 ms stack sampler
+(`VICTORY_PROFILE=<from>,<to>,1,<file>`) puts 38% of all samples on one wait,
+and the frames under it are the title's own - `ntdll+0x166464` <
+`KERNELBASE+0x1427f` (`WaitForSingleObject`) < `victory-image-*.dll+0x221c3c2`,
+with no frame of any victory module anywhere in the eight frames below it. The
+title is running its own job graph and its main thread waits for its workers.
+That is the floor this layer sits on; shortening it means giving the title fewer
+jobs, which is what the copy-back work below did.
 
-### Renderer patches (off by default while they are tested)
+## What got it there
+
+Measured on this PC, alternating arms in one session, heavy frames only.
+
+| Change | Effect |
+|---|---|
+| The five renderer ports (below) | 59.0 -> 44.0 ms |
+| [PR #477](https://github.com/Belobug/VIctory-Belobug-AMD/pull/477) `VICTORY_WC_NO_BACK=1`: shader writes into write-combined title memory that are 64 KiB or more stay on the card, with no snapshot, no compare and no copy-back | 53.3 -> 43.6 ms; copying back **18.1 -> 1.3 ms**, 22.8 -> 1.1 MB; copies up 63 -> 34 MB |
+| `VICTORY_RELAY=2` with `VICTORY_WIDE_BACK=1` (the launcher's defaults) | the submission thread stops waiting on per-flight work |
+
+The ports, all on in the launchers (`scripts\play.ps1` sets them):
 
 | Switch | What it does |
 |---|---|
@@ -62,130 +62,102 @@ describe which lighting paths run and the remaining rendering issues.
 | `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
 | `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
 
-### Other switches
+## What was measured and did not help
 
-| Switch | What it does |
+Every one of these was run as an A/B in one session, and every one is recorded
+with its numbers in [`docs/tuned-2026-11-27.md`](docs/tuned-2026-11-27.md).
+
+| Tried | Result |
 |---|---|
-| `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
-| `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
-| `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
-| `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
-| `VICTORY_KBM_GTA=1` | Optional GTA V PC-style keyboard and mouse mapping on the stand-in pad: `F2` or `` ` `` (`~`) toggles mouse-look and auto-hides the cursor while locked (`Esc`/`P`/focus loss unlocks and restores it), LMB/RMB = RT/LT, MMB/`C` = R3, `Shift` = A, `Space` = X, `R` = B, `F` = Y, `Tab` = LB, `Q` = RB, `Ctrl` = L3, `E` = D-pad Right, `V` = View. Tune with `VICTORY_MOUSE_SENS` (default `1.0`) and `VICTORY_MOUSE_INVERT_Y=1` (or pass via `scripts\play.ps1 -More @{VICTORY_KBM_GTA='1'}`) |
-
-What is known to be wrong:
-
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+| Output at 1920x1080 (renders 1280x720) | -3 ms while the copy-back was 18 ms; **with `WC_NO_BACK` it reverses** (copying back comes back as 18-21 ms and the card's time triples). `run-tuned-1080.bat` is kept only as a counter-example |
+| Output at 2560x1440 | the copy-back is cheapest but preparing hits 46.6 ms and once 174.6 ms: a pathological fractional-scale path. Do not use |
+| Dropping `VICTORY_WC_NO_BACK_MIN_KB` to 16 or 8 KiB to save 720p | no: 17.6 ms of copying back at 8 KiB. At 720p those ranges are not left on the card at all |
+| PC FSR 4.1.2, `performance` (1920x1080 -> 3840x2160) | works, -0.3 ms (43.8 -> 43.5): the frame is the title's CPU work, the card was never the limit. A picture choice, not a speed one |
+| [PR #443](https://github.com/Belobug/VIctory-Belobug-AMD/pull/443) exact mappings and lock waits | no gain on top of #477: it fixes waits that were on the copy-back path #477 removed |
+| [PR #649](https://github.com/Belobug/VIctory-Belobug-AMD/pull/649) AVX2 codegen (`x86-64-v3`) | no change in three bracketed blocks (43.0 / 45.4 / 46.9) |
+| The descriptor heap mirror (`HostHeap::sync_slots`) | 13.0 ms of work a frame, but only 0.66 ms of it is waited for: the rest hides behind preparing |
+| `VICTORY_GPU_TIMING=1`, `LAND_THREADS=8`, `CARD_BUFFERS=1`, `JOIN_PARTS=16`, `THIN=0`, `CARD_AWAKE=0`, `MAP_THREADS`, all five ports off | no gain, or not decidable; see the doc |
 
 ## How to run it
 
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+model 6.6 and mesh shaders, and your own copy of the title. This tree is played
+from the three launchers in its root; all of them keep the shader and image
+caches in `D:\victory-data\belobug` (see `victory.toml`) so that the other
+victory-family forks on this PC do not share them.
+
+| Launcher | What it is |
+|---|---|
+| `run-tuned.bat` | **the one to play.** 3840x2160 output, `WC_NO_BACK`, the five ports, 8 GiB texture budget, the title's own upscaler. Log: `runs\memtrim.log` |
+| `run-tuned-fsr.bat` | the same with PC FSR 4.1.2 at `quality` (2560x1440 -> 3840x2160): the same frame, a better upscaler. Needs the provider folder below. Log: `runs\memtrim-fsr.log` |
+| `run-tuned-1080.bat` | 1920x1080 output. **Measured 2026-11-28: not worth using** with `WC_NO_BACK`; kept as a counter-example |
+
+For PC FSR 4.1.2, put AMD's signed provider in one folder and point
+`VICTORY_FIDELITYFX_DIR` at it. The whole `Kits/FidelityFX/signedbin` set has to
+be there - upscaler, loader, framegeneration, denoiser, radiancecache - or the
+layer fails to load it with `0xC000007B`. The real
+`amd_fidelityfx_upscaler_dx12.dll` for SDK 2.4.0 is 57,664,272 bytes (blob
+`6d01d9f5`); a smaller file from a mirror is another build and loads nothing.
+The title profile and the PC FidelityFX bridge were ported from
+[DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
+
+`VICTORY_FSR_4K` takes `quality` (2560x1440), `balanced` (2258x1270) or
+`performance` (1920x1080); all three present at 3840x2160. AMD's SDK offers FSR
+4.1.2 for some cards only; where it does not, the newest 3.1 it offers is used
+and the log says so, and where it offers neither the run stops before the title
+starts and names what it was offered.
+
+On a hybrid-graphics PC the runtime prefers a high-performance adapter with
+Shader Model 6.6 and logs its name, vendor and device IDs. Set
+`VICTORY_D3D12_ADAPTER` to a DXGI index or part of the adapter's name to choose.
+
+## Building
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+cargo xtask policy                          # no game-derived file in the tree
 ```
 
-The launcher requests light device removal diagnostics (DRED) by default with
-`-Build diag`. DRED requires `--features diagnostics`. For a release binary
-built with that feature, request DRED with
-`-Build release -More @{VICTORY_D3D12_DRED='light'}`.
+`diag` is the profile every measurement here is of: release code generation
+plus the `diagnostics` feature, and light device removal (DRED) diagnostics by
+default. It is not built with LTO (`lto = false`, 16 codegen units) so that a
+rebuild is 40 s rather than minutes. Deploying means copying
+`target\diag\victory.exe` over the one the launcher uses; stop the title first,
+`taskkill /F /IM victory.exe`, and retry until it is gone - the title is loaded
+inside the victory process, there is no separate game process.
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+## Known problems
 
-For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
-`VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
-`amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
-`Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
+- **Under `VICTORY_RELAY=2`, a descriptor slot can be rewritten while a list
+  still in the air reads it**: black stripes across the screen and the faces of
+  characters close to the camera disappearing. This is
+  [#545](https://github.com/Belobug/VIctory-Belobug-AMD/issues/545), reproduced
+  on RDNA3 and RDNA4. `VICTORY_LATE_WAIT=0` removes it and takes the frame from
+  45.7 to 113.9 ms. [PR #636](https://github.com/Belobug/VIctory-Belobug-AMD/pull/636)
+  makes a slot flip only at a moment with nothing in the air; it is built into a
+  separate tree here (`D:\victory-belobug\VIctory-636`, `run-636.bat`) to be
+  judged on the picture, because one measured block (43.0 and 53.2 ms, the
+  second a stall) says nothing.
+- **`WC_NO_BACK`'s own census** (13 minutes, 0 reads of a title page): about 20%
+  of the ranges cannot be guarded, a write followed by a read inside the same
+  second is not seen, and one tester in five saw a shirt turn dark grey once.
+- Trees, signs and far objects flicker in some places; lighting is too bright or
+  too dark after walking indoors until the title has run a while; textures of
+  what just came into view appear late while the title streams; the first run of
+  a new build stutters while the driver makes pipelines.
+- Recording a frame in the world makes the title's own watchdog end it.
 
-`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
-the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
-and `performance` selects 1920×1080. All three output 3840×2160. With
-`victory run` directly, set `VICTORY_FSR_4K` to the preset name.
-AMD's SDK offers FSR 4.1.2 for some cards only. Where it does not, the
-newest FSR 3.1 it offers is used in its place and the log says so; its
-picture differs from FSR 4's. Where it offers neither, the run stops
-before the title starts and names the versions that were offered.
-The log reports the provider at context creation and the actual input and
-output sizes at the first successful temporal dispatch. The title profile
-and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
+## Where the numbers are
 
-On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
-high-performance adapter with Shader Model 6.6. The runtime logs its adapter
-name, PCI vendor and device IDs, and dedicated VRAM. Set
-`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
-name to select it explicitly. With the launcher, pass
-`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
+[`docs/tuned-2026-11-27.md`](docs/tuned-2026-11-27.md) is the log of this fork's
+tuning: how the benchmark works and what it can resolve (a same-session A/B,
+heavy frames only, medians over 45 s of a fixed replay), the copy-back chapter
+from 18.1 ms to 1.3 ms, the resolution lines that lost, FSR, AVX2, PR #443 and
+#636, and the external forks whose issue trackers were read for candidates.
 
-Before the first run, ahead of time (both can be stopped and go on later):
-
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
-
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
-
-## What is different here
-
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
-
-## Credits
-
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
-
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
-
-## License
-
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+This tree stands on [Marvisak/VIctory](https://github.com/Marvisak/VIctory), its
+forks (fxceless, avatarmanz's 7900XTX work, whose notes are kept in
+[docs/README-fxceless.md](docs/README-fxceless.md)) and the PRs cited above.
+VIctory source is GPL-3.0-or-later; the BCPack format tables are separate data
+outside that license and are not in this repository.
