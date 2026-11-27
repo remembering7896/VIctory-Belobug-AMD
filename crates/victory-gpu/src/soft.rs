@@ -29,8 +29,10 @@ use crate::watch::{Bits, PAGE};
 pub trait Pin: Send + Sync {
     /// Reads `to` from the page; false if it cannot be read that way.
     fn read(&self, to: &mut [u8]) -> bool;
-    /// Makes the kernel map this page at `at`; false if it cannot.
-    fn map(&self, at: usize) -> bool;
+    /// Makes the kernel map this page at `at`; false if it cannot. Takes
+    /// `Arc<Self>` so a page that maps can record itself: the view table may
+    /// not have it, and a later unmap must still keep its placeholder.
+    fn map(self: Arc<Self>, at: usize) -> bool;
 }
 
 #[repr(u8)]
@@ -44,6 +46,10 @@ pub enum Mode {
 static SOFT: Bits = Bits::new();
 /// The pins they show, by the view page's address.
 static PINS: Mutex<Option<HashMap<usize, Arc<dyn Pin>>>> = Mutex::new(None);
+/// Pages a pin mapped, by address. The title's view table may not have them:
+/// a fault must not wait for it. A later unmap asks here instead, so the
+/// placeholder it leaves is one a pin can map again.
+static MADE_AT: Mutex<Option<HashMap<usize, Arc<dyn Pin>>>> = Mutex::new(None);
 
 /// Notes on: a view made soft, a page made real, a view let go.
 static NOTED: AtomicU64 = AtomicU64::new(0);
@@ -127,9 +133,13 @@ pub fn real(at: usize, len: usize) -> bool {
             SOFT.take(b);
             continue;
         };
-        if !pin.map(base) {
+        if !pin.clone().map(base) {
             FAILED.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(at = format_args!("{base:#x}"), "a soft page could not be mapped");
+            tracing::error!(
+                at = format_args!("{base:#x}"),
+                error = %std::io::Error::last_os_error(),
+                "a soft page could not be mapped"
+            );
             return false;
         }
         SOFT.take(b);
@@ -169,6 +179,37 @@ pub fn read(at: usize, to: &mut [u8]) -> bool {
     }
     READ_BYTES.fetch_add(to.len() as u64, Ordering::Relaxed);
     true
+}
+
+/// Records a page a pin has mapped at `at`.
+pub fn made(at: usize, pin: Arc<dyn Pin>) {
+    if let Some(table) = made_at().as_mut() {
+        table.insert(at - at % PAGE, pin);
+    }
+}
+
+fn made_at() -> std::sync::MutexGuard<'static, Option<HashMap<usize, Arc<dyn Pin>>>> {
+    let mut guard = MADE_AT.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get_or_insert_with(Default::default);
+    guard
+}
+
+/// The addresses in `[at, at + len)` a pin has mapped and nobody has let go:
+/// they are mapped now, and their placeholders must be kept when they go.
+pub fn taken(at: usize, len: usize) -> Vec<usize> {
+    let mut taken = Vec::new();
+    if len == 0 {
+        return taken;
+    }
+    if let Some(table) = made_at().as_mut() {
+        let (first, until) = (block(at), block(at + len - 1) + 1);
+        for b in first..until {
+            if table.remove(&(b * PAGE)).is_some() {
+                taken.push(b * PAGE);
+            }
+        }
+    }
+    taken
 }
 
 /// `(noted, made real, let go, bytes read, failed)` since the start.

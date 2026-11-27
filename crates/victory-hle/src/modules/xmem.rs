@@ -1423,7 +1423,7 @@ impl victory_gpu::soft::Pin for PagePin {
         n == to.len()
     }
 
-    fn map(&self, at: usize) -> bool {
+    fn map(self: Arc<Self>, at: usize) -> bool {
         use windows_sys::Win32::System::Memory::{
             MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, MapViewOfFile3,
         };
@@ -1456,6 +1456,10 @@ impl victory_gpu::soft::Pin for PagePin {
             };
             physical.views.insert(at, (PAGE, slice));
         }
+        // Recorded where an unmap will look even when the table above was
+        // busy: a mapped page's placeholder must be kept when it goes, or no
+        // pin can map that address again.
+        victory_gpu::soft::made(at, self);
         true
     }
 }
@@ -2039,6 +2043,24 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         return;
     }
     let end = base + len;
+    // Pages a pin mapped: the title's table may not know them (soft::made).
+    // They are views like any other and keep their placeholders when they go.
+    for at in victory_gpu::soft::taken(base, len) {
+        // SAFETY: a view a pin mapped there; it becomes a placeholder again.
+        let gone = counted(Call::Unmap, || unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: at as *mut c_void,
+                },
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        });
+        if gone != 0 {
+            victory_gpu::title_memory_unmapping(at, PAGE);
+            physical.holes.insert(at, PAGE);
+        }
+    }
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
     let first = physical
