@@ -1651,7 +1651,7 @@ fn known_views(first: usize, last: usize) -> bool {
 
 /// A bit per block of the address space, in pieces made when first needed
 /// and never let go.
-struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
+pub(crate) struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
 
 /// The bits of 4 GiB.
 type BitsPiece = [std::sync::atomic::AtomicU64; Bits::WORDS];
@@ -1661,7 +1661,7 @@ impl Bits {
     /// 128 TiB, what a process has.
     const PIECES: usize = 1 << 15;
 
-    const fn new() -> Bits {
+    pub(crate) const fn new() -> Bits {
         Bits([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Bits::PIECES])
     }
 
@@ -1671,7 +1671,7 @@ impl Bits {
         unsafe { piece.as_ref() }
     }
 
-    fn set(&self, block: usize) {
+    pub(crate) fn set(&self, block: usize) {
         use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
         let word = block / 64;
         let Some(place) = self.0.get(word / Bits::WORDS) else {
@@ -1766,7 +1766,7 @@ impl Bits {
     }
 
     /// Whether it was set, and is no more.
-    fn take(&self, block: usize) -> bool {
+    pub(crate) fn take(&self, block: usize) -> bool {
         self.any(block, block + 1) && {
             let (word, bit) = (block / 64, 1 << (block % 64));
             self.piece(word)
@@ -1774,7 +1774,7 @@ impl Bits {
         }
     }
 
-    fn clear(&self, block: usize) {
+    pub(crate) fn clear(&self, block: usize) {
         let word = block / 64;
         if let Some(piece) = self.piece(word) {
             // Ahead of the protection's change, and seen by whoever the
@@ -1784,7 +1784,7 @@ impl Bits {
     }
 
     /// Whether a bit of `[first, last)` is set.
-    fn any(&self, first: usize, last: usize) -> bool {
+    pub(crate) fn any(&self, first: usize, last: usize) -> bool {
         let mut block = first;
         while block < last {
             let word = block / 64;

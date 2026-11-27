@@ -8979,6 +8979,10 @@ fn zero(to: *mut u8, n: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    // A view the layer noted and never mapped reads from its books.
+    if crate::soft::read(src as usize, dst) {
+        return true;
+    }
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
