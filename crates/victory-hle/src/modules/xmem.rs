@@ -1358,10 +1358,15 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
+    victory_gpu::soft::use_books(&SOFT_BOOKS);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
+    if victory_gpu::soft::on() && from != 0 {
+        note_soft(&mut physical, to, from, len);
+        return true;
+    }
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -1377,6 +1382,62 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// Notes `[to, to + len)` as a soft view of the pages at `from`, and tells the
+/// GPU side what the range shows as [`map`] would: only the kernel mapping is
+/// left for the moment a page is touched (`victory_gpu::soft`). The view is
+/// not put in `Physical::views`: nothing is mapped at `to` yet, and what is
+/// mapped there must stay what `slice_at` answers.
+fn note_soft(physical: &mut Physical, to: usize, from: usize, len: usize) {
+    let mut shown = shown_mut();
+    for k in (0..len).step_by(PAGE) {
+        let at = from + k;
+        let Some(slice) = physical.slice_at(at) else { break };
+        shown.note(to + k, PAGE, &slice);
+        victory_gpu::title_memory_remapped(to + k, PAGE);
+        victory_gpu::title_memory_view(to + k, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
+        victory_gpu::soft::noted(to + k, at, PAGE);
+    }
+}
+
+/// The books a soft view reads from and is mapped by: the title's own pages,
+/// read through the section's kept view, so a page need not be mapped at `at`
+/// to be read.
+struct SoftBooks;
+
+static SOFT_BOOKS: SoftBooks = SoftBooks;
+
+impl victory_gpu::soft::Books for SoftBooks {
+    fn read(&self, from: usize, _at: usize, to: &mut [u8]) -> bool {
+        let physical = physical();
+        let Some(slice) = physical.slice_at(from) else {
+            return false;
+        };
+        let Some(window) = slice.section.window(slice.index, 1) else {
+            return false;
+        };
+        let n = to.len().min(PAGE);
+        // SAFETY: the section's own view, kept by the section, of the page at
+        // `slice.index`: `window` commits the pages it returns.
+        unsafe { std::ptr::copy_nonoverlapping(window as *const u8, to.as_mut_ptr(), n) };
+        n == to.len()
+    }
+
+    fn map(&self, at: usize, from: usize, len: usize) -> bool {
+        let mut physical = physical();
+        let mut k = 0;
+        while k < len {
+            let Some(slice) = physical.slice_at(from + k) else {
+                return false;
+            };
+            let n = PAGE.min(len - k);
+            if !map(&mut physical, at + k, n, slice) {
+                return false;
+            }
+            k += n;
+        }
+        true
+    }
+}
 /// A page-mapping call that took long: logged on the way out, early returns
 /// included. The 4.5 s stall of one run (before the device went) was the
 /// submitting thread inside a submission, and the title's page-mapping copies
@@ -1412,6 +1473,18 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _slow = Slow::ranges(ranges);
     let _costed = Costed::begin(None);
     lift_thread();
+    victory_gpu::soft::use_books(&SOFT_BOOKS);
+    if victory_gpu::soft::on() {
+        let mut physical = physical();
+        for &(to, from, len) in ranges {
+            let (to, from, len) = (to as usize, from as usize, len as usize);
+            unmap(&mut physical, to, len);
+            if from != 0 {
+                note_soft(&mut physical, to, from, len);
+            }
+        }
+        return true;
+    }
     if side_by_side() <= 1 {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
@@ -1938,6 +2011,7 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
+    victory_gpu::soft::gone(base, len);
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
