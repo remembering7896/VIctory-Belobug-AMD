@@ -47,6 +47,15 @@ const MOST: u64 = 512 << 20;
 /// Our buffers are made in sizes of powers of two from this on.
 const LEAST: u64 = 4 << 20;
 
+/// The size of a new buffer for `total` bytes, or `None` if the one we
+/// have (`have` bytes) holds them.
+fn bounce_size(have: Option<u64>, total: u64) -> Option<u64> {
+    if have.is_some_and(|have| have >= total) {
+        return None;
+    }
+    Some(total.next_power_of_two().max(LEAST))
+}
+
 /// One submission's: a copy list and our buffer in the card's memory.
 pub(super) struct Slot {
     allocator: ID3D12CommandAllocator,
@@ -153,9 +162,13 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
-    if slot.bounce.as_ref().is_none_or(|b| b.1 < total) {
-        let size = total.next_power_of_two().max(LEAST);
-        slot.bounce = None;
+    if let Some(size) = bounce_size(slot.bounce.as_ref().map(|b| b.1), total) {
+        // The slot's last submission has run, but a buffer let go goes
+        // through the bury lag like every other object of ours: the device
+        // losses of 2026-11-25 were memory freed too early.
+        if let Some((old, _)) = slot.bounce.take() {
+            super::retire_resource(old);
+        }
         let Some(made) = host.uav_buffer(size) else {
             q.free.push(slot);
             STATS[3].fetch_add(1, Relaxed);
@@ -226,5 +239,20 @@ pub(super) fn line(frames: f64) {
              {copies:.0} ranges, {:.1} MB; {before:.1} submissions sent up on the drawing queue (too big, or nothing to send with)",
             bytes / 1048576.0
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_buffer_is_made_only_when_the_one_we_have_is_too_small() {
+        assert_eq!(bounce_size(None, 1), Some(LEAST));
+        assert_eq!(bounce_size(Some(LEAST), LEAST), None);
+        assert_eq!(bounce_size(Some(LEAST), LEAST + 256), Some(2 * LEAST));
+        assert_eq!(bounce_size(Some(64 << 20), 5 << 20), None);
+        assert_eq!(bounce_size(None, (5 << 20) + 1), Some(8 << 20));
+        assert_eq!(bounce_size(None, MOST), Some(MOST));
     }
 }

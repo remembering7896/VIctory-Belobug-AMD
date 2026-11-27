@@ -38,33 +38,29 @@ const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
-/// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
-pub(crate) fn room(memory: Option<[u64; 4]>) {
-    if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
-        return;
-    }
-    // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
-    // spares while the system is short of memory, and idle blocks let go now,
-    // not at the pool's next allocation.)
-    let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+/// Sets the empty texture block limit and sweeps idle upload memory once a second.
+pub(crate) fn room(memory: Option<[u64; 4]>, host_pressure: bool) {
+    let residency = crate::residency::on();
+    let keep_textures = crate::host::keep_freed() && !(residency && host_pressure);
+    let limit = spares(memory, keep_textures);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
-    if let Ok(mut pool) = TEXTURES.try_lock() {
+    if residency && let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
-            0
-        } else if pressure {
-            1
-        } else {
-            limit
-        };
+        let staging_limit = staging_spares(limit, host_pressure, crate::residency::critical_commit());
         pool.reclaim(tick, staging_limit, true);
+    }
+}
+
+fn staging_spares(limit: usize, host_pressure: bool, critical_commit: bool) -> usize {
+    if critical_commit {
+        0
+    } else if host_pressure {
+        limit.min(1)
+    } else {
+        limit
     }
 }
 
@@ -754,12 +750,12 @@ mod tests {
         for i in 0..12 {
             pool.add(i, 0);
         }
-        pool.reclaim(0, SPARE_KEPT, true);
+        pool.reclaim(0, staging_spares(SPARE_KEPT, false, false), true);
         assert_eq!(pool.blocks(), STAGING_KEPT + 1);
-        pool.reclaim(REST - 1, SPARE, true);
-        assert_eq!(pool.blocks(), SPARE + 1);
+        pool.reclaim(REST - 1, staging_spares(SPARE_KEPT, true, false), true);
+        assert_eq!(pool.blocks(), 2);
         assert_eq!(pool.resting.len(), 1);
-        pool.reclaim(REST, 0, true);
+        pool.reclaim(REST, staging_spares(SPARE_KEPT, true, true), true);
         assert_eq!(pool.blocks(), 1);
         assert!(pool.resting.is_empty());
         pool.give(held, REST);

@@ -32,8 +32,42 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 /// Least bytes of the smaller levels a key is made of.
 pub(crate) const MIN_PREFIX: u64 = 32 << 10;
 /// Bytes of levels kept in memory at most (the rest is read from the folder
-/// when asked).
-const KEPT: u64 = 4 << 30;
+/// when asked): `VICTORY_TEXTURE_STORE_KEPT_MB`, 4096 when unset. Nothing
+/// held is let go before the end. With 0 nothing is held, and each texture
+/// found is read from the folder (`std::fs::read`) on the recording thread
+/// that asks.
+fn kept_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| env_mb("VICTORY_TEXTURE_STORE_KEPT_MB").unwrap_or(4 << 30))
+}
+
+/// Bytes of textures waiting for the store's thread at most:
+/// `VICTORY_TEXTURE_STORE_QUEUE_MB`, no limit when unset. A texture over it
+/// is not kept this time (a later read of it is asked again); one is always
+/// taken when none waits, however large.
+fn queue_most() -> Option<u64> {
+    static MOST: OnceLock<Option<u64>> = OnceLock::new();
+    *MOST.get_or_init(|| env_mb("VICTORY_TEXTURE_STORE_QUEUE_MB"))
+}
+
+/// Bytes of textures waiting for the store's thread ([`keep`]'s copies).
+static QUEUED: AtomicU64 = AtomicU64::new(0);
+/// Textures not kept, the queue being full ([`queue_most`]).
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+fn env_mb(name: &str) -> Option<u64> {
+    parse_mb(std::env::var(name).ok().as_deref())
+}
+
+/// A count of MB as bytes, if it is one.
+fn parse_mb(v: Option<&str>) -> Option<u64> {
+    v?.trim().parse::<u64>().ok().map(|mb| mb.saturating_mul(1 << 20))
+}
+
+/// Whether a texture of `len` bytes is queued, `queued` bytes waiting.
+fn admit(queued: u64, len: u64, most: Option<u64>) -> bool {
+    most.is_none_or(|most| queued == 0 || queued.saturating_add(len) <= most)
+}
 
 /// A texture's shape: width, height, format, levels.
 pub(crate) type Shape = [u32; 4];
@@ -115,6 +149,7 @@ fn store() -> Option<&'static Store> {
                         return;
                     };
                     for job in receive {
+                        QUEUED.fetch_sub(job.tiled.len() as u64, Relaxed);
                         // (The store is made before this thread's first job.)
                         let Some(store) = store() else {
                             continue;
@@ -170,7 +205,7 @@ pub(crate) fn key_levels(layout: &victory_formats::texture::Layout, mips: u32) -
 /// A texture of `shape` was read whole: `tiled` is its memory (all levels),
 /// `parts` where the host lays out each of its levels (offset, row pitch,
 /// rows). Detiled and kept on the store's thread, unless that content is
-/// known.
+/// known or the queue is full ([`queue_most`]).
 pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tiled: &[u8], parts: Vec<(u64, u32, u32)>) {
     let Some(store) = store() else {
         return;
@@ -179,8 +214,16 @@ pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tile
     if !store.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(blob) {
         return;
     }
+    let len = tiled.len() as u64;
+    if QUEUED.fetch_update(Relaxed, Relaxed, |q| admit(q, len, queue_most()).then(|| q + len)).is_err() {
+        store.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&blob);
+        DROPPED.fetch_add(1, Relaxed);
+        return;
+    }
     let job = Job { shape, layout: layout.clone(), tiled: tiled.to_vec(), parts, blob };
-    let _ = store.jobs.lock().unwrap_or_else(|e| e.into_inner()).send(job);
+    if store.jobs.lock().unwrap_or_else(|e| e.into_inner()).send(job).is_err() {
+        QUEUED.fetch_sub(len, Relaxed);
+    }
 }
 
 /// A texture to keep ([`keep`]).
@@ -225,7 +268,7 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
             index.insert(*k, *e);
         }
     }
-    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
+    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= kept_most() {
         store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
         store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, bytes.clone());
     }
@@ -250,7 +293,7 @@ pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u
         None => {
             let bytes = Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
             STATS[4].fetch_add(1, Relaxed);
-            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
+            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= kept_most() {
                 store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
                 store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, bytes.clone());
             }
@@ -268,10 +311,12 @@ pub(crate) fn line() -> Option<String> {
     Some(format!(
         "texture store (VICTORY_TEXTURE_STORE), since the start: {at_start} keys from earlier runs, {kept} textures kept \
          ({} MB written, {} MB held in memory), {asked} first views from a smaller level asked, {found} found ({read} read \
-         from the folder), {} host copies made whole from it",
+         from the folder), {} host copies made whole from it, {} not kept with the queue full ({} MB waiting)",
         written >> 20,
         store.kept_bytes.load(Relaxed) >> 20,
-        PREFILLED.load(Relaxed)
+        PREFILLED.load(Relaxed),
+        DROPPED.load(Relaxed),
+        QUEUED.load(Relaxed) >> 20
     ))
 }
 
@@ -290,5 +335,27 @@ mod tests {
         assert_eq!(k, key);
         assert_eq!((e.blob, e.levels), (entry.blob, entry.levels));
         assert!(parse_line("1 2 3").is_none());
+    }
+
+    #[test]
+    fn queue_limit() {
+        assert!(admit(u64::MAX, u64::MAX, None));
+        assert!(admit(0, 100 << 20, Some(1 << 20)));
+        assert!(admit(0, 5, Some(0)));
+        assert!(!admit(1, 5, Some(0)));
+        assert!(admit(10, 20, Some(30)));
+        assert!(!admit(10, 21, Some(30)));
+        assert!(!admit(u64::MAX, 1, Some(u64::MAX - 1)));
+    }
+
+    #[test]
+    fn mb_read() {
+        assert_eq!(parse_mb(None), None);
+        assert_eq!(parse_mb(Some("")), None);
+        assert_eq!(parse_mb(Some("x")), None);
+        assert_eq!(parse_mb(Some("-1")), None);
+        assert_eq!(parse_mb(Some("0")), Some(0));
+        assert_eq!(parse_mb(Some(" 512 ")), Some(512 << 20));
+        assert_eq!(parse_mb(Some("99999999999999999")), Some(u64::MAX));
     }
 }

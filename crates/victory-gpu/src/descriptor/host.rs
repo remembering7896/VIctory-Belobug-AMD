@@ -612,7 +612,9 @@ pub(crate) struct Spans {
     first: std::collections::HashMap<u32, (u32, u64)>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
-    /// descriptions, thousands of times a frame).
+    /// descriptions, thousands of times a frame). By description without
+    /// its filler words (`crate::resource::without_filler`), which do not
+    /// change the size.
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
 }
 
@@ -646,12 +648,8 @@ impl Spans {
     /// The bytes of title memory a placed texture with the resource
     /// description `desc` takes (`crate::resource::placed_bytes`).
     fn bytes(&mut self, desc: &[u32; 14]) -> Option<u64> {
-        if let Some(&known) = self.sizes.get(desc) {
-            return known;
-        }
-        let bytes = crate::resource::placed_bytes(desc);
-        self.sizes.insert(*desc, bytes);
-        bytes
+        let desc = crate::resource::without_filler(desc);
+        *self.sizes.entry(desc).or_insert_with(|| crate::resource::placed_bytes(&desc))
     }
 
     /// The starts of the spans that overlap `[start, end)`, each taken to
@@ -3401,6 +3399,14 @@ impl HostHeap {
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
+            // A texture the card had no memory for: the slot is not noted as
+            // made from this record, so the next ask makes it again (it kept
+            // its null view for good, avatarmanz/VIctory-7900XTX#256).
+            let retry = kept.is_none()
+                && matches!(view, View::Shader(resource, _) if crate::resource::retrying(resource as crate::object::This));
+            if retry {
+                self.made.set(index, 0);
+            }
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
             }
@@ -3409,7 +3415,7 @@ impl HostHeap {
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
-            self.quick_is(index, if later { 0 } else { key });
+            self.quick_is(index, if later || retry { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
         }

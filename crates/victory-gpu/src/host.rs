@@ -555,11 +555,11 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
-    crate::residency::refresh();
-    if crate::residency::pressured() {
+    let host_pressure = crate::residency::refresh();
+    if host_pressure {
         trim_spare_chunks();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::pool::room(host().and_then(|h| h.video_memory()), host_pressure);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1202,6 +1202,19 @@ mod tests {
             assert!(out.iter().all(|&b| b == 0));
             assert_ne!(VirtualFree(at.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+
+    /// Only what lies between, before and after the runs is zeroed.
+    #[test]
+    fn only_bytes_outside_the_runs_are_zeroed() {
+        let mut dst = [7u8; 16];
+        super::zero_between(&mut dst, 100, &[(102, 3), (104, 2), (110, 4)]);
+        assert_eq!(dst, [0, 0, 7, 7, 7, 7, 0, 0, 0, 0, 7, 7, 7, 7, 0, 0]);
+        let mut dst = [7u8; 4];
+        super::zero_between(&mut dst, 100, &[(100, 4)]);
+        assert_eq!(dst, [7; 4]);
+        super::zero_between(&mut dst, 100, &[]);
+        assert_eq!(dst, [0; 4]);
     }
 
     /// Zeros for a title destination that went meanwhile are no fault.
@@ -2029,6 +2042,32 @@ const SPARE_MOST: u64 = 128 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
 
+/// The most bytes of chunks kept while no list holds them: [`SPARE_KEPT`]
+/// with [`keep_freed`] unless [`crate::residency::limited_host_ram`], else
+/// [`SPARE_MOST`].
+/// `VICTORY_SCRATCH_SPARE_MB` sets it instead (`0`: none kept, every chunk
+/// is freed when its list gives it back). Lower, more chunks are freed at
+/// give-back and made anew by the next list; nothing else changes.
+fn spare_most() -> u64 {
+    static ASKED: OnceLock<Option<u64>> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        std::env::var("VICTORY_SCRATCH_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    });
+    spare_limit(asked, keep_freed(), crate::residency::limited_host_ram())
+}
+
+/// [`spare_most`] for a limit asked in MiB, [`keep_freed`] and
+/// [`crate::residency::limited_host_ram`] (`limited`).
+fn spare_limit(asked_mb: Option<u64>, keep: bool, limited: bool) -> u64 {
+    match asked_mb {
+        Some(mb) => mb.saturating_mul(1 << 20),
+        None if keep && !limited => SPARE_KEPT,
+        None => SPARE_MOST,
+    }
+}
+
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
 /// is reset or dropped, for the next list. Before, a list kept every chunk
@@ -2097,7 +2136,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
+/// or dropped): kept for the next list, or freed past [`spare_most`] and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
@@ -2108,8 +2147,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_KEPT } else { SPARE_MOST };
-                spare.give(chunk, size, limit)
+                spare.give(chunk, size, spare_most())
             } else {
                 Some(chunk)
             };
@@ -2130,8 +2168,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
-/// Lets go of the scratch chunks kept idle, when the system is short of
-/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
+/// Releases cached scratch chunks when the system is short of memory.
 fn trim_spare_chunks() {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -8951,13 +8988,15 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// reads). What the runtime's record says is mapped is read in one go each,
 /// and by pieces where that fails; memory it has no record of by pieces.
 pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
-    dst.fill(0);
     let (start, len) = (src as usize, dst.len());
     let mut got = 0;
     let mut runs = crate::inplace::shown_runs(start, len);
     if runs.is_empty() {
         runs.push((start, len));
     }
+    // Every byte of a run is read or zeroed below: only the rest is zeroed
+    // here, not the whole buffer first (one write over all of it less).
+    zero_between(dst, start, &runs);
     for (at, n) in runs {
         let piece = &mut dst[at - start..at - start + n];
         if read_into(at as *const u8, piece) {
@@ -8984,6 +9023,20 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
         });
     }
     got
+}
+
+/// Zeros what of `dst` (title memory from `start`) `runs` (in order,
+/// within `dst`: address, bytes) leave out.
+fn zero_between(dst: &mut [u8], start: usize, runs: &[(usize, usize)]) {
+    let mut done = 0;
+    for &(at, n) in runs {
+        let from = at - start;
+        if from > done {
+            dst[done..from].fill(0);
+        }
+        done = done.max(from + n);
+    }
+    dst[done..].fill(0);
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -10585,7 +10638,24 @@ mod trail {
 
 #[cfg(test)]
 mod spare {
-    use super::Spare;
+    use super::{SPARE_KEPT, SPARE_MOST, Spare, spare_limit};
+
+    /// Unset, the limit is as it was: 1 GiB with `keep_freed` unless the
+    /// host's RAM is limited, 128 MiB otherwise. An asked limit wins.
+    #[test]
+    fn spare_limit_is_as_before_unless_asked() {
+        assert_eq!(SPARE_KEPT, 1 << 30);
+        assert_eq!(SPARE_MOST, 128 << 20);
+        assert_eq!(spare_limit(None, true, false), 1 << 30);
+        assert_eq!(spare_limit(None, true, true), 128 << 20);
+        assert_eq!(spare_limit(None, false, false), 128 << 20);
+        assert_eq!(spare_limit(None, false, true), 128 << 20);
+        for (keep, limited) in [(true, false), (true, true), (false, false), (false, true)] {
+            assert_eq!(spare_limit(Some(64), keep, limited), 64 << 20);
+            assert_eq!(spare_limit(Some(0), keep, limited), 0);
+        }
+        assert_eq!(spare_limit(Some(u64::MAX), true, false), u64::MAX);
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.

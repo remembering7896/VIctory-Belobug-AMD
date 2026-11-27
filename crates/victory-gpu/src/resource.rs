@@ -1226,8 +1226,9 @@ struct Hosted {
     /// When the host copy was last asked for (`crate::host::moment`),
     /// written under `made`'s lock.
     used: std::sync::atomic::AtomicU64,
-    /// The host refused to make it: not tried again.
-    refused: std::sync::atomic::AtomicBool,
+    /// The host refused to make it: not tried again before this
+    /// `crate::host::coarse_ms` (`u64::MAX`: for good; 0: not refused).
+    refused_until: std::sync::atomic::AtomicU64,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
@@ -1357,21 +1358,31 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+#[cfg(windows)]
+thread_local! {
+    /// [`placed_bytes_from`]'s answers, by description without its filler
+    /// and first level. Never trimmed: bounded by the distinct descriptions
+    /// without filler a thread asks about (a title has a few thousand), times
+    /// the first levels its callers pass (`first_mip`: at most 16).
+    static PLACED_SIZES: std::cell::RefCell<std::collections::HashMap<([u32; 14], u32), Option<u64>>> =
+        std::cell::RefCell::default();
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
 #[cfg(windows)]
 pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
-    if first == 0 || !held_only() {
-        return placed_bytes(desc);
-    }
-    type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
-    thread_local! {
-        static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
-    }
-    KNOWN.with(|known| {
+    // The size is a function of the description's fields alone, never of
+    // its filler words, so they are left out of the key.
+    let desc = &without_filler(desc);
+    let first = if held_only() { first } else { 0 };
+    PLACED_SIZES.with(|known| {
         *known.borrow_mut().entry((*desc, first)).or_insert_with(|| {
             let whole = placed_bytes(desc)?;
+            if first == 0 {
+                return Some(whole);
+            }
             // SAFETY: 56 bytes in the description's layout.
             let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
             let Some(t) = texture_layout(&d).filter(|t| t.planes.len() == 1) else {
@@ -1602,8 +1613,31 @@ pub(crate) fn host_waits(this: This) -> bool {
     }
     let r = resource(this);
     r.desc.dimension != BUFFER
-        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
+        && !refused(r)
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+}
+
+/// How long a texture the card had no memory for waits before it is asked
+/// for again (as long as uploads wait, `crate::residency`).
+#[cfg(windows)]
+const RETRY_MS: u64 = 500;
+
+/// Whether the host refused `r`'s copy and is not asked again yet.
+#[cfg(windows)]
+fn refused(r: &Resource) -> bool {
+    crate::host::coarse_ms() < r.host.refused_until.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether title texture `this` has no host copy because the card had no
+/// memory for it, and will be asked again ([`RETRY_MS`]): a slot that shows
+/// it is not done with.
+#[cfg(windows)]
+pub(crate) fn retrying(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let until = resource(this).host.refused_until.load(std::sync::atomic::Ordering::Relaxed);
+    until != 0 && until != u64::MAX
 }
 
 /// The host side of title texture `this`: made now if it is not there and
@@ -1617,9 +1651,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     if made.is_none() {
-        if !make || r.host.refused.load(Relaxed) {
+        if !make || refused(r) {
             return None;
         }
+        let _ = crate::residency::take_out_of_memory();
         let clear = r
             .host
             .clear
@@ -1687,9 +1722,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            // Out of memory: asked again once the card may have room (it was
+            // refused for good, and stayed without a host copy, avatarmanz/VIctory-7900XTX#256); any
+            // other refusal is for good.
+            let until = if crate::residency::take_out_of_memory() {
+                crate::host::coarse_ms().saturating_add(RETRY_MS)
+            } else {
+                u64::MAX
+            };
+            r.host.refused_until.store(until, Relaxed);
             return None;
         };
+        r.host.refused_until.store(0, Relaxed);
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -2518,6 +2562,12 @@ fn host_texture(
     host_texture_as(desc, state, clear, false)
 }
 
+#[cfg(all(windows, test))]
+thread_local! {
+    /// The error the next texture [`host_texture_as`] makes fails with.
+    static FAIL_NEXT: std::cell::Cell<Option<windows::core::HRESULT>> = const { std::cell::Cell::new(None) };
+}
+
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
 /// tiles level by level (`crate::tiles`).
 #[cfg(windows)]
@@ -2634,6 +2684,14 @@ fn host_texture_as(
             )
         }
     };
+    #[cfg(test)]
+    let made = match FAIL_NEXT.take() {
+        Some(code) => {
+            texture = None;
+            Err(code.into())
+        }
+        None => made,
+    };
     if let Err(e) = &made {
         crate::residency::allocation_error(e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
@@ -2643,6 +2701,7 @@ fn host_texture_as(
         && let Some(t) = &texture
         && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
     {
+        crate::residency::allocation_error(&e);
         tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
         texture = None;
     }
@@ -2790,7 +2849,7 @@ fn hand_out_resource(
             // then color or depth and stencil: 5 words) or null.
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
-            refused: std::sync::atomic::AtomicBool::new(false),
+            refused_until: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -3045,22 +3104,58 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The placed textures asked for with filler words set, as asked
-/// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+/// (address and description): for [`PLACED_TWINS`]. At most
+/// [`twin_room`] entries: past that, new twins go uncounted.
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
 /// filler was left out of the key ([`texture_at`]).
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
-#[cfg(windows)]
-#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether [`PLACED_RAW`] holding `len` entries takes one more.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn twin_room(len: usize) -> bool {
+    len < 65_536
+}
+
+/// Counts in [`PLACED_TWINS`] a placed texture at `address` asked for with
+/// the filler words `raw` when another set of them was seen for `key`.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn count_twin(address: u64, raw: &[u32; 14], key: &[u32; 14]) {
+    if raw == key {
+        return;
+    }
+    let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
+    if !twin_room(seen.len()) || !seen.insert((address, *raw)) {
+        return;
+    }
+    let others = seen
+        .range((address, [0; 14])..=(address, [u32::MAX; 14]))
+        .filter(|(_, r)| without_filler(r) == *key);
+    if others.count() > 1 {
+        PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `desc` with words 1 and 13, the filler of its layout, zeroed: what the
+/// title leaves there is not part of what a texture is ([`texture_at`]).
+/// The padding of [`ResourceDesc`] after `dimension` and after `flags`.
+#[cfg(windows)]
+pub(crate) fn without_filler(desc: &[u32; 14]) -> [u32; 14] {
+    let mut d = *desc;
+    d[1] = 0;
+    d[13] = 0;
+    d
 }
 
 /// Width, height and format of texture `this` (`None` for a buffer), for
@@ -3139,30 +3234,17 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
         key[1] = 0;
         key[13] = 0;
     }
-    let desc = &key;
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
-    if raw != key {
-        let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.insert((address, raw)) {
-            let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
-                let mut blank = *r;
-                blank[1] = 0;
-                blank[13] = 0;
-                blank == key
-            });
-            if others.count() > 1 {
-                PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    }
+    #[cfg(feature = "diagnostics")]
+    count_twin(address, desc, &key);
+    let desc = &key;
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
@@ -3700,6 +3782,38 @@ mod tests {
             assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
+    }
+
+    /// A texture the card had no memory for is made once the wait is over
+    /// (avatarmanz/VIctory-7900XTX#256); one the host refused for another reason stays refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_refused_for_want_of_memory_is_made_later() {
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        if crate::host::host().is_none() || !lazy() {
+            return; // no host GPU here, or host copies made at creation
+        }
+        let null = std::ptr::null();
+        for (error, again) in [(E_OUTOFMEMORY, true), (E_INVALIDARG, false)] {
+            // A render target: made on its own, not cut from a block.
+            let mut desc = texture(4, 4, 28, 1);
+            desc.flags = 1;
+            let mut image = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 4, null.cast(), &RESOURCE_IIDS[0], &mut image),
+                S_OK
+            );
+            FAIL_NEXT.set(Some(error));
+            assert!(hosted(image, true).is_none(), "{error:?}");
+            assert_eq!(FAIL_NEXT.get(), None, "the failure was not injected");
+            assert_eq!(retrying(image), again, "{error:?}");
+            // Not asked again before its time.
+            assert!(hosted(image, true).is_none(), "{error:?}");
+            std::thread::sleep(std::time::Duration::from_millis(RETRY_MS + 100));
+            assert_eq!(hosted(image, true).is_some(), again, "{error:?}");
+            assert!(!retrying(image), "{error:?}");
+            assert_eq!(slot::<Release>(image, 0x10)(image), 0);
         }
     }
 
@@ -4681,5 +4795,34 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// The filler words of a placed texture's description change neither
+    /// its size nor what is remembered of it.
+    #[cfg(windows)]
+    #[test]
+    fn placed_sizes_leave_out_the_filler() {
+        let desc = [3u32, 0, 0, 0, 256, 0, 256, 0x9_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut junk = desc;
+        junk[1] = 0xdead_beef;
+        junk[13] = 0x1234_5678;
+        assert_eq!(without_filler(&junk), desc);
+        assert_eq!(placed_bytes_from(&desc, 0), placed_bytes(&desc));
+        for first in [0, 2] {
+            assert_eq!(placed_bytes_from(&junk, first), placed_bytes_from(&desc, first));
+        }
+        let known = PLACED_SIZES.with(|k| k.borrow().len());
+        for first in [0, 2] {
+            assert!(placed_bytes_from(&junk, first).is_some());
+        }
+        assert_eq!(PLACED_SIZES.with(|k| k.borrow().len()), known);
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn placed_twins_stop_at_the_cap() {
+        assert!(twin_room(0));
+        assert!(twin_room(65_535));
+        assert!(!twin_room(65_536));
     }
 }
